@@ -8,6 +8,7 @@ Ver README.md para instalación, despliegue en Render y variables de entorno.
 """
 import os
 import sys
+import hmac
 import json
 import math
 import asyncio
@@ -24,6 +25,10 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "sismos_peru_dm_alerta")
 
 # Si se define, /test_alarma exige este token (evita que cualquiera haga sonar el teléfono).
 TEST_TOKEN = os.environ.get("TEST_TOKEN", "")
+
+# Mínimo de segundos entre dos pruebas, aunque el token sea correcto (frena el spam de alarmas).
+TEST_INTERVALO_S = 600
+ultima_prueba = 0.0
 
 # Puerto asignado por Render ($PORT) o 8088 local
 PORT = int(os.environ.get("PORT", 8088))
@@ -299,8 +304,14 @@ async def index_handler(request):
 
 
 async def test_alarma_handler(request):
-    if TEST_TOKEN and request.headers.get("X-Token") != TEST_TOKEN:
+    global ultima_prueba
+    if TEST_TOKEN and not hmac.compare_digest(request.headers.get("X-Token", ""), TEST_TOKEN):
         return web.Response(status=403, text="Token incorrecto.")
+    ahora = datetime.now(timezone.utc).timestamp()
+    espera = int(ultima_prueba + TEST_INTERVALO_S - ahora)
+    if espera > 0:
+        return web.Response(status=429, text=f"Ya se envió una prueba. Espera {espera // 60 + 1} min.")
+    ultima_prueba = ahora
     titulo = "📳 PRUEBA DE ALARMA Y VIBRACIÓN"
     cuerpo = (
         "Prueba de alerta sísmica con prioridad urgente.\n"

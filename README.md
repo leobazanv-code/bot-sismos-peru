@@ -51,4 +51,4 @@ En Windows también puedes usar `iniciar_bot.bat`. El panel queda en http://loca
 ## Panel web
 
 `GET /` muestra el estado real de las fuentes: conexión con EMSC, última consulta correcta a USGS y alertas enviadas en las últimas 3 h.
-`POST /test_alarma` envía una alerta de prueba. Exige la cabecera `X-Token` si está definido `TEST_TOKEN`.
+`POST /test_alarma` envía una alerta de prueba, como máximo una cada 10 min. Exige la cabecera `X-Token` si está definido `TEST_TOKEN`.
