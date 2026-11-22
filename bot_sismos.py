@@ -1,20 +1,38 @@
+"""Monitor sísmico para Perú con alertas push vía ntfy.
+
+Fuentes:
+  - EMSC (seismicportal.eu) por WebSocket, en tiempo real.
+  - USGS por consulta HTTP cada 25 s, como respaldo.
+
+Ver README.md para instalación, despliegue en Render y variables de entorno.
+"""
 import os
+import sys
 import json
 import math
 import asyncio
 import urllib.request
+from html import escape as html_escape
 from datetime import datetime, timezone
 import websockets
 from aiohttp import web
 
 # ================= CONFIGURACIÓN =================
-# Canal único para la app ntfy en tu teléfono
-NTFY_TOPIC = "sismos_peru_dm_alerta"
+# Canal ntfy al que está suscrito el teléfono. Los canales de ntfy.sh son públicos:
+# quien conozca el nombre puede leer y publicar. Defínelo en la variable NTFY_TOPIC.
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "sismos_peru_dm_alerta")
+
+# Si se define, /test_alarma exige este token (evita que cualquiera haga sonar el teléfono).
+TEST_TOKEN = os.environ.get("TEST_TOKEN", "")
 
 # Puerto asignado por Render ($PORT) o 8088 local
 PORT = int(os.environ.get("PORT", 8088))
 
-# Límites geográficos de Perú (incluye franja marítima donde nacen los tsunamis y fallas)
+# Magnitud mínima para alertar
+MAG_MIN = 3.8
+
+# Rectángulo aproximado que contiene a Perú y su franja marítima.
+# Ojo: también incluye el sur de Ecuador, Acre (Brasil), el oeste de Bolivia y Arica (Chile).
 PERU_BOUNDS = {
     "min_lat": -19.5,
     "max_lat": 0.5,
@@ -22,7 +40,7 @@ PERU_BOUNDS = {
     "max_lon": -68.0
 }
 
-# Principales ciudades de referencia en los 24 departamentos del Perú
+# Una ciudad de referencia por cada uno de los 24 departamentos (más Callao y ciudades costeras)
 CIUDADES_PERU = [
     {"nombre": "Lima", "lat": -12.0464, "lon": -77.0428},
     {"nombre": "Callao", "lat": -12.0565, "lon": -77.1181},
@@ -54,12 +72,47 @@ CIUDADES_PERU = [
     {"nombre": "Madre de Dios (Puerto Maldonado)", "lat": -12.5933, "lon": -69.1891}
 ]
 
-# Historial en memoria para no repetir alertas del mismo evento
-sismos_procesados = set()
+# Línea de costa peruana simplificada (lat, lon), de norte a sur.
+# shortcut: interpolación lineal con ~20 puntos, error de unos 20-30 km; usar un shapefile si se necesita precisión.
+COSTA_PERU = [
+    (-3.40, -80.30),   # Tumbes / Zarumilla
+    (-4.10, -81.10),   # Máncora
+    (-4.58, -81.27),   # Talara
+    (-5.09, -81.11),   # Paita
+    (-5.80, -81.10),   # Punta Aguja
+    (-6.80, -79.95),   # Pimentel (Chiclayo)
+    (-7.40, -79.57),   # Pacasmayo
+    (-8.10, -79.05),   # Trujillo
+    (-9.08, -78.60),   # Chimbote
+    (-10.07, -78.16),  # Huarmey
+    (-11.10, -77.62),  # Huacho
+    (-12.05, -77.15),  # Callao
+    (-13.70, -76.22),  # Pisco
+    (-15.35, -75.17),  # San Juan de Marcona
+    (-15.85, -74.25),  # Chala
+    (-16.62, -72.71),  # Camaná
+    (-17.02, -72.02),  # Mollendo
+    (-17.64, -71.34),  # Ilo
+    (-18.35, -70.40),  # Frontera con Chile
+]
+
+# Velocidad aproximada de la onda S (la que más sacude), en km/s
+VEL_ONDA_S = 3.5
+
+# Eventos ya alertados: (id, epoch_origen, lat, lon). Sirve para no repetir alertas,
+# incluso cuando EMSC y USGS reportan el mismo sismo con IDs distintos.
+alertados = []
+VENTANA_HISTORIAL_S = 3 * 3600   # se olvidan eventos de más de 3 h
+DUP_SEGUNDOS = 120               # mismo sismo si difieren menos de 2 min...
+DUP_KM = 150                     # ...y menos de 150 km entre epicentros
+
+# Estado real de las fuentes, mostrado en el panel web
+estado = {"emsc_conectado": False, "emsc_ultimo_msg": None, "usgs_ultimo_ok": None, "usgs_error": None}
 # =================================================
 
+
 def distancia_km(lat1, lon1, lat2, lon2):
-    """Calcula la distancia esférica exacta en km (fórmula de Haversine)"""
+    """Distancia en km sobre una Tierra esférica (Haversine). Error típico menor al 0.5 %."""
     R = 6371.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     d_phi = math.radians(lat2 - lat1)
@@ -67,77 +120,104 @@ def distancia_km(lat1, lon1, lat2, lon2):
     a = math.sin(d_phi / 2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lam / 2)**2
     return R * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
 
-def encontrar_ciudades_cercanas(lat, lon):
-    """Encuentra la ciudad más cercana y la distancia a Lima"""
-    ciudades_ordenadas = sorted(
-        CIUDADES_PERU,
-        key=lambda c: distancia_km(c["lat"], c["lon"], lat, lon)
-    )
-    mas_cercana = ciudades_ordenadas[0]
+
+def ciudad_mas_cercana(lat, lon):
+    """Devuelve (nombre de la ciudad más cercana, km a esa ciudad, km a Lima)."""
+    mas_cercana = min(CIUDADES_PERU, key=lambda c: distancia_km(c["lat"], c["lon"], lat, lon))
     dist_cercana = distancia_km(mas_cercana["lat"], mas_cercana["lon"], lat, lon)
-    
-    # Distancia a Lima
     dist_lima = distancia_km(-12.0464, -77.0428, lat, lon)
-    
     return mas_cercana["nombre"], dist_cercana, dist_lima
 
-def evaluar_tsunami(mag, prof_km, lon):
-    if mag >= 7.0 and prof_km < 60 and lon < -75.0:
-        return "🔴 ¡ALERTA ROJA DE TSUNAMI! Evacuar litoral y zonas costeras bajas."
-    elif mag >= 6.5 and prof_km < 70 and lon < -75.0:
-        return "⚠️ ATENCIÓN DE TSUNAMI: Monitoreo preventivo del litoral peruano."
-    return "🟢 NO reúne condiciones para tsunami en el litoral peruano."
 
-def procesar_y_alertar(sismo_id, lat, lon, mag, depth, region):
-    global sismos_procesados
-    
-    # Evitar duplicados
-    if sismo_id in sismos_procesados:
-        return
-    sismos_procesados.add(sismo_id)
-    if len(sismos_procesados) > 300:
-        sismos_procesados.clear()
+def lon_costa(lat):
+    """Longitud de la costa peruana a una latitud dada (interpolada; fuera del rango, el extremo)."""
+    if lat >= COSTA_PERU[0][0]:
+        return COSTA_PERU[0][1]
+    for (lat_a, lon_a), (lat_b, lon_b) in zip(COSTA_PERU, COSTA_PERU[1:]):
+        if lat_b <= lat <= lat_a:
+            return lon_a + (lat - lat_a) / (lat_b - lat_a) * (lon_b - lon_a)
+    return COSTA_PERU[-1][1]
 
-    # Encontrar la ciudad más cercana en todo el Perú y distancia a Lima
-    ciudad_cercana, dist_cercana, dist_lima = encontrar_ciudades_cercanas(lat, lon)
-    t_onda_cercana = max(0, int(dist_cercana / 3.5))
-    t_onda_lima = max(0, int(dist_lima / 3.5))
 
-    # Definir nivel de severidad y VIBRACIÓN GARANTIZADA:
-    # 'urgent' (prioridad 5 en ntfy) ACTIVA VIBRACIÓN OBLIGATORIA Y SONIDO DE EMERGENCIA
+def es_costero_o_marino(lat, lon, margen_km=50):
+    """True si el epicentro está en el mar o a menos de `margen_km` tierra adentro."""
+    margen_grados = margen_km / (111.32 * math.cos(math.radians(lat)))
+    return lon < lon_costa(lat) + margen_grados
+
+
+def evaluar_tsunami(mag, prof_km, lat, lon):
+    """Estimación orientativa propia, NO es un aviso oficial.
+    Los avisos oficiales de tsunami en Perú los emite la DHN (Marina de Guerra) y los difunde INDECI."""
+    if not es_costero_o_marino(lat, lon):
+        return "🟢 Epicentro tierra adentro: sin condiciones para tsunami."
+    if mag >= 7.0 and prof_km < 60:
+        return "🔴 POSIBLE TSUNAMI (estimación, no oficial). Aléjate de la playa y sigue a DHN / INDECI."
+    if mag >= 6.5 and prof_km < 70:
+        return "⚠️ Revisa los avisos de la DHN: sismo costero con cierto potencial de tsunami."
+    return "🟢 No reúne condiciones típicas para tsunami."
+
+
+def es_duplicado(sismo_id, t_origen, lat, lon):
+    """True si el evento ya fue alertado (mismo ID, o mismo sismo reportado por otra fuente)."""
+    ahora = datetime.now(timezone.utc).timestamp()
+    alertados[:] = [e for e in alertados if ahora - e[1] < VENTANA_HISTORIAL_S]
+    for e_id, e_t, e_lat, e_lon in alertados:
+        if e_id == sismo_id:
+            return True
+        if abs(e_t - t_origen) < DUP_SEGUNDOS and distancia_km(e_lat, e_lon, lat, lon) < DUP_KM:
+            return True
+    return False
+
+
+def procesar_y_alertar(sismo_id, t_origen, lat, lon, mag, depth, region):
+    if es_duplicado(sismo_id, t_origen, lat, lon):
+        return False
+    alertados.append((sismo_id, t_origen, lat, lon))
+
+    ciudad, dist_cercana, dist_lima = ciudad_mas_cercana(lat, lon)
+    # Tiempo que tarda la onda S en llegar, contado desde el origen del sismo (no desde la alerta).
+    # Usa distancia al hipocentro (incluye la profundidad).
+    t_onda_cercana = int(math.hypot(dist_cercana, depth) / VEL_ONDA_S)
+    t_onda_lima = int(math.hypot(dist_lima, depth) / VEL_ONDA_S)
+
+    # Prioridad ntfy: 'urgent' (5) = vibración larga y sonido; 'high' (4) = vibración y sonido.
+    # El teléfono puede silenciarlas (No Molestar, ajustes del canal en la app ntfy).
     if mag >= 6.0:
-        alerta_tipo = "🚨 ¡TERREMOTO / SISMO MAYOR EN PERÚ!"
+        alerta_tipo = "🚨 ¡TERREMOTO / SISMO MAYOR!"
         prioridad = "urgent"
         tags = "rotating_light,sos,warning"
     elif mag >= 5.0:
-        alerta_tipo = "🚨 ¡SISMO FUERTE EN PERÚ!"
+        alerta_tipo = "🚨 ¡SISMO FUERTE!"
         prioridad = "urgent"
         tags = "warning,rotating_light,earth_americas"
     elif mag >= 4.2:
-        alerta_tipo = "⚠️ SISMO MODERADO EN PERÚ"
-        prioridad = "urgent"  # URGENT para garantizar que vibre y suene en el celular
+        alerta_tipo = "⚠️ SISMO MODERADO"
+        prioridad = "urgent"
         tags = "warning,earth_americas"
-    else: # 3.8 a 4.1
-        alerta_tipo = "📢 SISMO LEVE EN PERÚ"
-        prioridad = "high"   # HIGH activa vibración y sonido
+    else:  # MAG_MIN a < 4.2
+        alerta_tipo = "📢 SISMO LEVE"
+        prioridad = "high"
         tags = "earth_americas,bell"
 
-    tsunami_txt = evaluar_tsunami(mag, depth, lon)
+    tsunami_txt = evaluar_tsunami(mag, depth, lat, lon)
 
     titulo = f"{alerta_tipo} · M {mag:.1f}"
     cuerpo = (
         f"💥 Magnitud: M {mag:.1f}\n"
         f"📍 Zona: {region}\n"
         f"📏 Profundidad: {depth:.0f} km\n\n"
-        f"🏙️ Más cercano a: {ciudad_cercana} (~{dist_cercana:.0f} km | Onda: ~{t_onda_cercana}s)\n"
-        f"🏛️ Distancia a Lima: ~{dist_lima:.0f} km (Onda: ~{t_onda_lima}s)\n\n"
+        f"🏙️ Más cercano a: {ciudad} (~{dist_cercana:.0f} km)\n"
+        f"🏛️ Distancia a Lima: ~{dist_lima:.0f} km\n"
+        f"⏱️ Onda S llega ~{t_onda_cercana}s (cercana) / ~{t_onda_lima}s (Lima) tras el sismo\n\n"
         f"🌊 Tsunami: {tsunami_txt}\n"
         f"Mantén la calma y mantente informado."
     )
 
     actions = f"view, Ver Epicentro en Google Maps, https://maps.google.com/?q={lat},{lon}"
-    print(f"\n[ENVIANDO ALERTA A TODO PERÚ] {titulo} | Cerca de: {ciudad_cercana} ({dist_cercana:.0f}km)")
+    print(f"\n[ENVIANDO ALERTA] {titulo} | Cerca de: {ciudad} ({dist_cercana:.0f}km)")
     enviar_ntfy(titulo, cuerpo, prioridad=prioridad, tags=tags, actions=actions)
+    return True
+
 
 def enviar_ntfy(titulo, cuerpo, prioridad="urgent", tags="warning", actions=None):
     url = f"https://ntfy.sh/{NTFY_TOPIC}"
@@ -157,9 +237,22 @@ def enviar_ntfy(titulo, cuerpo, prioridad="urgent", tags="warning", actions=None
         print(f"❌ Error al enviar alerta a ntfy: {e}")
         return False
 
+
+def hace(epoch):
+    if epoch is None:
+        return "nunca"
+    s = int(datetime.now(timezone.utc).timestamp() - epoch)
+    return f"hace {s} s" if s < 120 else f"hace {s // 60} min"
+
+
 # ================= VISTA WEB / PANEL DE CONTROL =================
 async def index_handler(request):
-    html = f"""<!DOCTYPE html>
+    emsc = "🟢 Conectado" if estado["emsc_conectado"] else "🔴 Desconectado (reintentando)"
+    usgs = f"último OK {hace(estado['usgs_ultimo_ok'])}"
+    if estado["usgs_error"]:
+        usgs += f" · último error: {html_escape(estado['usgs_error'])}"
+    js_token = 'prompt("Token de prueba:")' if TEST_TOKEN else '""'
+    html =f"""<!DOCTYPE html>
 <html lang="es">
 <head>
     <meta charset="UTF-8">
@@ -179,13 +272,13 @@ async def index_handler(request):
 <body>
     <div class="card">
         <h1>🚨 Monitor Sísmico Nacional</h1>
-        <div class="badge">🇵🇪 Cobertura 24/7: Todo el Perú</div>
+        <div class="badge">🇵🇪 Cobertura: Perú y franja marítima (M ≥ {MAG_MIN})</div>
 
         <div class="status">
-            <div><strong>🟢 Estado:</strong> Enlace en tiempo real activo</div>
-            <div><strong>📡 Cobertura:</strong> 24 departamentos y litoral peruano</div>
-            <div><strong>📳 Modo Vibración:</strong> Activado (Prioridad Urgente 5)</div>
-            <div><strong>📲 Canal ntfy:</strong> {NTFY_TOPIC}</div>
+            <div><strong>📡 EMSC (tiempo real):</strong> {emsc} · último mensaje {hace(estado['emsc_ultimo_msg'])}</div>
+            <div><strong>🛡️ USGS (respaldo):</strong> {usgs}</div>
+            <div><strong>📳 Prioridad:</strong> urgente (5) si M ≥ 4.2 · alta (4) si M &lt; 4.2</div>
+            <div><strong>🔔 Alertas enviadas (últimas 3 h):</strong> {len(alertados)}</div>
         </div>
 
         <button class="btn btn-test" onclick="probarAlarma()">📳 Probar Vibración y Alarma en Celular</button>
@@ -193,7 +286,9 @@ async def index_handler(request):
 
     <script>
         function probarAlarma() {{
-            fetch('/test_alarma', {{ method: 'POST' }})
+            const token = {js_token};
+            if (token === null) return;
+            fetch('/test_alarma', {{ method: 'POST', headers: {{ 'X-Token': token }} }})
                 .then(res => res.text())
                 .then(txt => alert('🔔 ' + txt));
         }}
@@ -202,80 +297,94 @@ async def index_handler(request):
 </html>"""
     return web.Response(text=html, content_type="text/html")
 
+
 async def test_alarma_handler(request):
-    titulo = "📳 PRUEBA DE ALARMA Y VIBRACIÓN - TODO EL PERÚ"
+    if TEST_TOKEN and request.headers.get("X-Token") != TEST_TOKEN:
+        return web.Response(status=403, text="Token incorrecto.")
+    titulo = "📳 PRUEBA DE ALARMA Y VIBRACIÓN"
     cuerpo = (
-        "¡Prueba de alerta sísmica nacional con vibración obligatoria!\n"
-        "Configuración activa: Cobertura total para los 24 departamentos de Perú.\n"
-        "Si tu teléfono vibró y sonó, el sistema está 100% operativo para cualquier sismo."
+        "Prueba de alerta sísmica con prioridad urgente.\n"
+        "Si tu teléfono vibró y sonó, las notificaciones de ntfy están bien configuradas."
     )
-    enviar_ntfy(titulo, cuerpo, prioridad="urgent", tags="warning,rotating_light,earth_americas")
-    return web.Response(text="Alarma de prueba con vibración enviada a tu app ntfy.")
+    ok = enviar_ntfy(titulo, cuerpo, prioridad="urgent", tags="warning,rotating_light,earth_americas")
+    if not ok:
+        return web.Response(status=502, text="No se pudo enviar a ntfy. Revisa los logs.")
+    return web.Response(text="Alarma de prueba enviada a tu app ntfy.")
+
 
 # ================= MOTOR SÍSMICO EN TIEMPO REAL =================
+def epoch_iso(texto):
+    """Convierte '2024-05-01T12:34:56.7Z' a epoch UTC. Si falla, usa la hora actual."""
+    try:
+        return datetime.strptime(texto[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return datetime.now(timezone.utc).timestamp()
+
+
+def en_zona(lat, lon, mag):
+    return (PERU_BOUNDS["min_lat"] <= lat <= PERU_BOUNDS["max_lat"] and
+            PERU_BOUNDS["min_lon"] <= lon <= PERU_BOUNDS["max_lon"] and
+            mag >= MAG_MIN)
+
+
 async def monitor_websocket():
     uri = "wss://www.seismicportal.eu/standing_order/websocket"
-    print("⚡ [WebSocket] Conectado al flujo global en tiempo real...")
     while True:
         try:
             async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as ws:
+                estado["emsc_conectado"] = True
+                print("⚡ [EMSC] Conectado al flujo en tiempo real.")
                 while True:
-                    mensaje = await ws.recv()
-                    evento = json.loads(mensaje)
-                    
+                    evento = json.loads(await ws.recv())
+                    estado["emsc_ultimo_msg"] = datetime.now(timezone.utc).timestamp()
+
                     if evento.get("action") in ["create", "update"]:
                         props = evento.get("data", {}).get("properties", {})
-                        s_id = str(props.get("unid") or props.get("source_id") or "")
                         lat = float(props.get("lat", 0))
                         lon = float(props.get("lon", 0))
                         mag = float(props.get("mag", 0))
-                        depth = float(props.get("depth", 0))
-                        region = props.get("flynn_region", "Perú")
-
-                        # Cobertura nacional: Todo Perú y magnitud >= 3.8
-                        if (PERU_BOUNDS["min_lat"] <= lat <= PERU_BOUNDS["max_lat"] and
-                            PERU_BOUNDS["min_lon"] <= lon <= PERU_BOUNDS["max_lon"] and
-                            mag >= 3.8):
-                            procesar_y_alertar(s_id, lat, lon, mag, depth, region)
+                        if en_zona(lat, lon, mag):
+                            s_id = str(props.get("unid") or props.get("source_id") or "")
+                            depth = float(props.get("depth", 0))
+                            region = props.get("flynn_region", "Perú")
+                            procesar_y_alertar(s_id, epoch_iso(props.get("time")), lat, lon, mag, depth, region)
 
         except Exception as e:
-            print(f"⚠️ [WebSocket] Reconectando en 5s... ({e})")
+            estado["emsc_conectado"] = False
+            print(f"⚠️ [EMSC] Reconectando en 5s... ({e})")
             await asyncio.sleep(5)
 
+
 async def monitor_usgs_backup():
-    """Motor de respaldo que consulta USGS cada 25 segundos para asegurar que ningún sismo se escape"""
-    print("🛡️ [Backup USGS] Iniciando monitor de respaldo nacional cada 25s...")
+    """Respaldo: consulta USGS cada 25 s y alerta los sismos de las últimas 2 h que EMSC no haya reportado."""
+    print("🛡️ [USGS] Iniciando monitor de respaldo cada 25s...")
     url = (
         "https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson"
-        "&minmagnitude=3.8"
+        f"&minmagnitude={MAG_MIN}"
         f"&minlatitude={PERU_BOUNDS['min_lat']}&maxlatitude={PERU_BOUNDS['max_lat']}"
         f"&minlongitude={PERU_BOUNDS['min_lon']}&maxlongitude={PERU_BOUNDS['max_lon']}"
-        "&limit=8"
+        "&limit=20"
     )
     await asyncio.sleep(10)
     while True:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "bot-sismos-peru"})
             with urllib.request.urlopen(req, timeout=8) as resp:
                 data = json.loads(resp.read().decode())
-                for f in data.get("features", []):
-                    p = f["properties"]
-                    geom = f["geometry"]["coordinates"]
-                    s_id = str(f["id"])
-                    lon = float(geom[0])
-                    lat = float(geom[1])
-                    depth = float(geom[2])
-                    mag = float(p["mag"])
-                    place = p["place"]
-
-                    # Verificar si ocurrió hace menos de 2 horas
-                    time_epoch = p["time"] / 1000
-                    ahora = datetime.now(timezone.utc).timestamp()
-                    if (ahora - time_epoch) < 7200:
-                        procesar_y_alertar(s_id, lat, lon, mag, depth, place)
+            estado["usgs_ultimo_ok"] = datetime.now(timezone.utc).timestamp()
+            estado["usgs_error"] = None
+            ahora = datetime.now(timezone.utc).timestamp()
+            for f in data.get("features", []):
+                p = f["properties"]
+                lon, lat, depth = (float(x) for x in f["geometry"]["coordinates"][:3])
+                t_origen = p["time"] / 1000
+                if ahora - t_origen < 7200:
+                    procesar_y_alertar(str(f["id"]), t_origen, lat, lon, float(p["mag"]), depth, p["place"])
         except Exception as e:
-            pass
+            estado["usgs_error"] = str(e)[:120]
+            print(f"⚠️ [USGS] Error en consulta de respaldo: {e}")
         await asyncio.sleep(25)
+
 
 async def main():
     app = web.Application()
@@ -286,7 +395,7 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"🟢 Servidor web nacional listo en puerto {PORT}")
+    print(f"🟢 Servidor web listo en puerto {PORT}")
 
     await asyncio.gather(
         monitor_websocket(),
@@ -294,7 +403,9 @@ async def main():
     )
 
 if __name__ == "__main__":
+    # Evita que un print con emojis falle (y corte el envío de la alerta) en consolas cp1252 de Windows
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n🛑 Monitor sísmico nacional detenido.")
+        print("\n🛑 Monitor sísmico detenido.")
