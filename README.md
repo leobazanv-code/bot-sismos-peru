@@ -38,6 +38,7 @@ En Windows también puedes usar `iniciar_bot.bat`. El panel queda en http://loca
 |---|---|---|
 | `NTFY_TOPIC` | Canal ntfy al que se envían las alertas | `sismos_peru_dm_alerta` |
 | `TEST_TOKEN` | Si se define, el botón de prueba pide este token | vacío (botón abierto) |
+| `NTFY_TOKEN` | Token de acceso de una cuenta ntfy.sh (`tk_...`). Necesario en Render: sin cuenta, ntfy limita por IP y la IP compartida de Render agota la cuota diaria (error 429) | vacío (envío anónimo) |
 | `PORT` | Puerto del panel web (Render lo asigna solo) | `8088` |
 
 **Seguridad:** los canales de ntfy.sh son públicos. Quien conozca el nombre del canal puede leer tus alertas y enviarte avisos falsos. Usa un nombre difícil de adivinar en `NTFY_TOPIC` y no lo publiques. Define `TEST_TOKEN` para que nadie pueda hacer sonar tu teléfono desde el panel público.
@@ -45,7 +46,7 @@ En Windows también puedes usar `iniciar_bot.bat`. El panel queda en http://loca
 ## Despliegue en Render
 
 - Tipo: **Web Service**. Build: `pip install -r requirements.txt`. Start: `python bot_sismos.py`.
-- Define `NTFY_TOPIC` y `TEST_TOKEN` en *Environment*.
+- Define `NTFY_TOPIC`, `TEST_TOKEN` y `NTFY_TOKEN` en *Environment*.
 - **Importante:** en el plan gratuito, Render apaga el servicio tras unos 15 min sin visitas web. Apagado, el bot **no vigila sismos**. Usa un plan de pago o un servicio externo que visite la URL cada pocos minutos (por ejemplo, UptimeRobot).
 
 ## Panel web

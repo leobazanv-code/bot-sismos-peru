@@ -26,6 +26,8 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "sismos_peru_dm_alerta")
 
 # Si se define, /test_alarma exige este token (evita que cualquiera haga sonar el teléfono).
 TEST_TOKEN = os.environ.get("TEST_TOKEN", "")
+# Token de una cuenta ntfy.sh: la cuota diaria pasa a contar por cuenta y no por la IP compartida de Render.
+NTFY_TOKEN = os.environ.get("NTFY_TOKEN", "")
 
 # Mínimo de segundos entre dos pruebas, aunque el token sea correcto (frena el spam de alarmas).
 TEST_INTERVALO_S = 600
@@ -233,6 +235,8 @@ def enviar_ntfy(titulo, cuerpo, prioridad="urgent", tags="warning", actions=None
         "Priority": prioridad,
         "Tags": tags
     }
+    if NTFY_TOKEN:
+        headers["Authorization"] = f"Bearer {NTFY_TOKEN}"
     if actions:
         headers["Actions"] = actions.encode("utf-8")
 
