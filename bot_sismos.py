@@ -12,6 +12,7 @@ import hmac
 import json
 import math
 import asyncio
+import urllib.error
 import urllib.request
 from html import escape as html_escape
 from datetime import datetime, timezone
@@ -112,7 +113,7 @@ DUP_SEGUNDOS = 120               # mismo sismo si difieren menos de 2 min...
 DUP_KM = 150                     # ...y menos de 150 km entre epicentros
 
 # Estado real de las fuentes, mostrado en el panel web
-estado = {"emsc_conectado": False, "emsc_ultimo_msg": None, "usgs_ultimo_ok": None, "usgs_error": None}
+estado = {"emsc_conectado": False, "emsc_ultimo_msg": None, "usgs_ultimo_ok": None, "usgs_error": None, "ntfy_error": None}
 # =================================================
 
 
@@ -218,7 +219,8 @@ def procesar_y_alertar(sismo_id, t_origen, lat, lon, mag, depth, region):
         f"Mantén la calma y mantente informado."
     )
 
-    actions = f"view, Ver Epicentro en Google Maps, https://maps.google.com/?q={lat},{lon}"
+    # La URL va entre comillas: sin ellas, la coma de "lat,lon" rompe el formato y ntfy rechaza la alerta (HTTP 400).
+    actions = f'view, Ver Epicentro en Google Maps, "https://maps.google.com/?q={lat},{lon}"'
     print(f"\n[ENVIANDO ALERTA] {titulo} | Cerca de: {ciudad} ({dist_cercana:.0f}km)")
     enviar_ntfy(titulo, cuerpo, prioridad=prioridad, tags=tags, actions=actions)
     return True
@@ -239,7 +241,14 @@ def enviar_ntfy(titulo, cuerpo, prioridad="urgent", tags="warning", actions=None
         with urllib.request.urlopen(req, timeout=8) as resp:
             return resp.status == 200
     except Exception as e:
-        print(f"❌ Error al enviar alerta a ntfy: {e}")
+        detalle = str(e)
+        if isinstance(e, urllib.error.HTTPError):
+            try:
+                detalle += " " + e.read().decode("utf-8", "replace")[:200]
+            except Exception:
+                pass
+        estado["ntfy_error"] = detalle
+        print(f"❌ Error al enviar alerta a ntfy: {detalle}")
         return False
 
 
@@ -319,7 +328,8 @@ async def test_alarma_handler(request):
     )
     ok = enviar_ntfy(titulo, cuerpo, prioridad="urgent", tags="warning,rotating_light,earth_americas")
     if not ok:
-        return web.Response(status=502, text="No se pudo enviar a ntfy. Revisa los logs.")
+        ultima_prueba = 0.0  # un envío fallido no bloquea reintentar
+        return web.Response(status=502, text=f"No se pudo enviar a ntfy: {estado['ntfy_error']}")
     return web.Response(text="Alarma de prueba enviada a tu app ntfy.")
 
 
