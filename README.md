@@ -38,9 +38,7 @@ En Windows también puedes usar `iniciar_bot.bat`. El panel queda en http://loca
 |---|---|---|
 | `NTFY_TOPIC` | Canal ntfy al que se envían las alertas | `sismos_peru_dm_alerta` |
 | `TEST_TOKEN` | Si se define, el botón de prueba pide este token | vacío (botón abierto) |
-| `NTFY_TOKEN` | Token de acceso de una cuenta ntfy.sh (`tk_...`). Ojo: con cuenta Gratis ntfy sigue limitando por IP, y la IP compartida de Render agota la cuota diaria (error 429); solo ntfy Pro lo evita | vacío (envío anónimo) |
-| `TELEGRAM_TOKEN` | Token del bot de Telegram creado con @BotFather. Canal gratis y sin cuota por IP: es la vía recomendada en Render | vacío (Telegram desactivado) |
-| `TELEGRAM_CHAT_ID` | Chat que recibe las alertas: tu id numérico, que aparece en `getUpdates` después de escribirle al bot | vacío |
+| `NTFY_TOKEN` | Token de acceso de una cuenta ntfy.sh (`tk_...`). Necesario en Render: sin cuenta, ntfy limita por IP y la IP compartida de Render agota la cuota diaria (error 429) | vacío (envío anónimo) |
 | `PORT` | Puerto del panel web (Render lo asigna solo) | `8088` |
 
 **Seguridad:** los canales de ntfy.sh son públicos. Quien conozca el nombre del canal puede leer tus alertas y enviarte avisos falsos. Usa un nombre difícil de adivinar en `NTFY_TOPIC` y no lo publiques. Define `TEST_TOKEN` para que nadie pueda hacer sonar tu teléfono desde el panel público.
