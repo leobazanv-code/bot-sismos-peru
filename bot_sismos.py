@@ -26,8 +26,11 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "sismos_peru_dm_alerta")
 
 # Si se define, /test_alarma exige este token (evita que cualquiera haga sonar el teléfono).
 TEST_TOKEN = os.environ.get("TEST_TOKEN", "")
-# Token de una cuenta ntfy.sh: la cuota diaria pasa a contar por cuenta y no por la IP compartida de Render.
+# Token de una cuenta ntfy.sh. Con cuenta Gratis la cuota sigue contando por IP (la compartida de Render); solo ntfy Pro cuenta por cuenta.
 NTFY_TOKEN = os.environ.get("NTFY_TOKEN", "")
+# Bot de Telegram (gratis y sin cuota por IP): token de @BotFather y chat_id del destinatario.
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # Mínimo de segundos entre dos pruebas, aunque el token sea correcto (frena el spam de alarmas).
 TEST_INTERVALO_S = 600
@@ -115,7 +118,7 @@ DUP_SEGUNDOS = 120               # mismo sismo si difieren menos de 2 min...
 DUP_KM = 150                     # ...y menos de 150 km entre epicentros
 
 # Estado real de las fuentes, mostrado en el panel web
-estado = {"emsc_conectado": False, "emsc_ultimo_msg": None, "usgs_ultimo_ok": None, "usgs_error": None, "ntfy_error": None}
+estado = {"emsc_conectado": False, "emsc_ultimo_msg": None, "usgs_ultimo_ok": None, "usgs_error": None, "ntfy_error": None, "telegram_error": None}
 # =================================================
 
 
@@ -224,8 +227,32 @@ def procesar_y_alertar(sismo_id, t_origen, lat, lon, mag, depth, region):
     # La URL va entre comillas: sin ellas, la coma de "lat,lon" rompe el formato y ntfy rechaza la alerta (HTTP 400).
     actions = f'view, Ver Epicentro en Google Maps, "https://maps.google.com/?q={lat},{lon}"'
     print(f"\n[ENVIANDO ALERTA] {titulo} | Cerca de: {ciudad} ({dist_cercana:.0f}km)")
+    enviar_telegram(titulo, f"{cuerpo}\n\n🗺️ https://maps.google.com/?q={lat},{lon}")
     enviar_ntfy(titulo, cuerpo, prioridad=prioridad, tags=tags, actions=actions)
     return True
+
+
+def enviar_telegram(titulo, cuerpo):
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    datos = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": f"{titulo}\n\n{cuerpo}"}).encode("utf-8")
+    req = urllib.request.Request(url, data=datos, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            estado["telegram_error"] = None
+            return resp.status == 200
+    except Exception as e:
+        # str(e) no incluye la URL, así que el token del bot no aparece en logs ni en el panel.
+        detalle = str(e)
+        if isinstance(e, urllib.error.HTTPError):
+            try:
+                detalle += " " + e.read().decode("utf-8", "replace")[:200]
+            except Exception:
+                pass
+        estado["telegram_error"] = detalle
+        print(f"❌ Error al enviar alerta a Telegram: {detalle}")
+        return False
 
 
 def enviar_ntfy(titulo, cuerpo, prioridad="urgent", tags="warning", actions=None):
@@ -298,6 +325,7 @@ async def index_handler(request):
             <div><strong>📳 Prioridad:</strong> urgente (5) si M ≥ 4.2 · alta (4) si M &lt; 4.2</div>
             <div><strong>🔔 Alertas enviadas (últimas 3 h):</strong> {len(alertados)}</div>
             <div><strong>🔑 Envío ntfy:</strong> {"con cuenta (NTFY_TOKEN)" if NTFY_TOKEN else "anónimo (sin NTFY_TOKEN)"}</div>
+            <div><strong>✈️ Envío Telegram:</strong> {"activo" if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID else "desactivado (falta TELEGRAM_TOKEN o TELEGRAM_CHAT_ID)"}</div>
         </div>
 
         <button class="btn btn-test" onclick="probarAlarma()">📳 Probar Vibración y Alarma en Celular</button>
@@ -329,13 +357,17 @@ async def test_alarma_handler(request):
     titulo = "📳 PRUEBA DE ALARMA Y VIBRACIÓN"
     cuerpo = (
         "Prueba de alerta sísmica con prioridad urgente.\n"
-        "Si tu teléfono vibró y sonó, las notificaciones de ntfy están bien configuradas."
+        "Si tu teléfono vibró y sonó, las notificaciones están bien configuradas."
     )
-    ok = enviar_ntfy(titulo, cuerpo, prioridad="urgent", tags="warning,rotating_light,earth_americas")
-    if not ok:
+    ok_tg = enviar_telegram(titulo, cuerpo)
+    ok_ntfy = enviar_ntfy(titulo, cuerpo, prioridad="urgent", tags="warning,rotating_light,earth_americas")
+    if not (ok_tg or ok_ntfy):
         ultima_prueba = 0.0  # un envío fallido no bloquea reintentar
-        return web.Response(status=502, text=f"No se pudo enviar a ntfy: {estado['ntfy_error']}")
-    return web.Response(text="Alarma de prueba enviada a tu app ntfy.")
+        return web.Response(status=502, text=(
+            f"No se pudo enviar. ntfy: {estado['ntfy_error']} · Telegram: "
+            f"{estado['telegram_error'] or 'no configurado'}"))
+    canales = " y ".join(n for n, ok in (("Telegram", ok_tg), ("ntfy", ok_ntfy)) if ok)
+    return web.Response(text=f"Alarma de prueba enviada a {canales}.")
 
 
 # ================= MOTOR SÍSMICO EN TIEMPO REAL =================
