@@ -297,6 +297,7 @@ async def index_handler(request):
             <div><strong>🛡️ USGS (respaldo):</strong> {usgs}</div>
             <div><strong>📳 Prioridad:</strong> urgente (5) si M ≥ 4.2 · alta (4) si M &lt; 4.2</div>
             <div><strong>🔔 Alertas enviadas (últimas 3 h):</strong> {len(alertados)}</div>
+            <div><strong>🔑 Envío ntfy:</strong> {"con cuenta (NTFY_TOKEN)" if NTFY_TOKEN else "anónimo (sin NTFY_TOKEN)"}</div>
         </div>
 
         <button class="btn btn-test" onclick="probarAlarma()">📳 Probar Vibración y Alarma en Celular</button>
